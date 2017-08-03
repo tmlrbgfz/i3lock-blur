@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <sys/sem.h>
 #include <unistd.h>
 #include <xcb/damage.h>
 #include <xcb/dpms.h>
@@ -75,6 +76,7 @@ extern pam_state_t pam_state;
 int failed_attempts = 0;
 bool show_failed_attempts = false;
 bool retry_verification = false;
+int semId = -1;
 
 static struct xkb_state *xkb_state;
 static struct xkb_context *xkb_context;
@@ -573,10 +575,38 @@ static void handle_map_notify(xcb_map_notify_event_t *event) {
          * expect to get another MapNotify, but better be sure… */
         dont_fork = true;
 
-        /* In the parent process, we exit */
-        if (fork() != 0)
-            exit(0);
-
+        /* Initializing IPC */
+        semId = semget(IPC_PRIVATE, 1, 0x1FF | IPC_CREAT | IPC_EXCL);
+        if(semId < 0) {
+            err(EXIT_FAILURE, "Could not initialize IPC.");
+        }
+        union semun {
+            int val;
+            struct semid_ds *buf;
+            unsigned short *array;
+        } arg;
+        arg.val = 0;
+        arg.val = 0;
+        int resultSemCtl = semctl(semId, 0, SETVAL, arg);
+        if(resultSemCtl < 0) {
+            err(EXIT_FAILURE, "Could not initialize IPC.");
+        }
+        /* In the parent process, wait for a notification from the child process */
+        if (fork() != 0) {
+            struct sembuf buf;
+            struct timespec tv;
+            tv.tv_sec = 2;
+            tv.tv_nsec = 0;
+            buf.sem_num = 0;
+            buf.sem_op = -1;
+            buf.sem_flg = 0;
+            int resultSemOp = semtimedop(semId, &buf, 1, &tv);
+            if(resultSemOp != 0) {
+                errx(EXIT_FAILURE, "Child process did not respond in time.");
+            } else {
+                exit(0);
+            }
+        }
         ev_loop_fork(EV_DEFAULT);
     }
 }
@@ -1055,6 +1085,42 @@ int main(int argc, char *argv[]) {
             "Could not lock page in memory, check RLIMIT_MEMLOCK");
 #endif
 
+    if (!dont_fork) {
+        dont_fork = true;
+        /* Initializing IPC */
+        semId = semget(IPC_PRIVATE, 1, 0x1FF | IPC_CREAT | IPC_EXCL);
+        if(semId < 0) {
+            err(EXIT_FAILURE, "Could not initialize IPC.");
+        }
+        union semun {
+            int val;
+            struct semid_ds *buf;
+            unsigned short *array;
+        } arg;
+        arg.val = 0;
+        int resultSemCtl = semctl(semId, 0, SETVAL, arg);
+        if(resultSemCtl < 0) {
+            err(EXIT_FAILURE, "Could not initialize IPC.");
+        }
+        /* In the parent process, wait for a notification from the child process */
+        if (fork() != 0) {
+            struct sembuf buf;
+            struct timespec tv;
+            tv.tv_sec = 2;
+            tv.tv_nsec = 0;
+            buf.sem_num = 0;
+            buf.sem_op = -1;
+            buf.sem_flg = 0;
+            int resultSemOp = semtimedop(semId, &buf, 1, &tv);
+            if(resultSemOp != 0) {
+                errx(EXIT_FAILURE, "Child process did not respond in time.");
+            } else {
+                exit(0);
+            }
+        }
+        ev_loop_fork(EV_DEFAULT);
+    }
+
     /* Initialize connection to X11 */
     if ((display = XOpenDisplay(NULL)) == NULL)
         errx(EXIT_FAILURE,
@@ -1221,14 +1287,15 @@ int main(int argc, char *argv[]) {
     ev_invoke(main_loop, xcb_check, 0);
     /* usually fork is called from mapnotify event handler, but in our case
      * a new window is not created and so the mapnotify event doesn't come */
-    if (fuzzy && !dont_fork) {
-        dont_fork = true;
-
-        /* In the parent process, we exit */
-        if (fork() != 0)
-            exit(0);
-
-        ev_loop_fork(EV_DEFAULT);
+    if (semId >= 0) {
+        struct sembuf buf;
+        buf.sem_num = 0;
+        buf.sem_op = 1;
+        buf.sem_flg = 0;
+        int semOpResult = semop(semId, &buf, 1);
+        if(semOpResult < 0) {
+            err(EXIT_FAILURE, "Could not communicate success to parent process.");
+        }
     }
     ev_loop(main_loop, 0);
 }
